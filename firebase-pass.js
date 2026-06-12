@@ -20,12 +20,12 @@ import {
 } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-firestore.js";
 
 const firebaseConfig = {
-  apiKey: "貼上你的 apiKey",
-  authDomain: "貼上你的 authDomain",
-  projectId: "貼上你的 projectId",
-  storageBucket: "貼上你的 storageBucket",
-  messagingSenderId: "貼上你的 messagingSenderId",
-  appId: "貼上你的 appId"
+  apiKey: "AIzaSyAmNPgtlowEM7DF1jbwQWCItozZzt8tzWc",
+  authDomain: "pass-credit-system.firebaseapp.com",
+  projectId: "pass-credit-system",
+  storageBucket: "pass-credit-system.firebasestorage.app",
+  messagingSenderId: "938198180976",
+  appId: "1:938198180976:web:e1c38afef59c819a5440b5"
 };
 
 const app = initializeApp(firebaseConfig);
