@@ -45,14 +45,14 @@
         <div class="auth-tab" onclick="switchAuthTab('register')">註冊帳號</div>
       </div>
       <div id="tab-login">
-        <div class="field"><label>帳號</label><input id="l-user" type="text" placeholder="輸入帳號"></div>
+        <div class="field"><label>Email</label><input id="l-user" type="email" placeholder="輸入 Email"></div>
         <div class="field"><label>密碼</label><input id="l-pass" type="password" placeholder="輸入密碼" onkeydown="if(event.key==='Enter')doLogin()"></div>
         <button class="btn-auth" onclick="doLogin()">進入 PASS</button>
         <div class="auth-err" id="l-err"></div>
       </div>
       <div id="tab-register" style="display:none">
         <div class="field"><label>姓名 / 暱稱</label><input id="r-name" type="text" placeholder="你的名字"></div>
-        <div class="field"><label>帳號</label><input id="r-user" type="text" placeholder="自訂帳號（英數）"></div>
+        <div class="field"><label>Email</label><input id="r-user" type="email" placeholder="輸入 Email，之後可跨瀏覽器登入"></div>
         <div class="field"><label>密碼</label><input id="r-pass" type="password" placeholder="至少 6 個字元"></div>
         <div class="field"><label>確認密碼</label><input id="r-pass2" type="password" placeholder="再輸入一次" onkeydown="if(event.key==='Enter')doRegister()"></div>
         <button class="btn-auth" onclick="doRegister()">建立帳號</button>

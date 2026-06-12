@@ -19,7 +19,14 @@ function saveDB(d){
 }
 let currentUser=null,currentDept=null;
 function getUD(){const db=loadDB();return db.users[currentUser]||{name:'',depts:{},password:''}}
-function saveUD(ud){const db=loadDB();db.users[currentUser]=ud;saveDB(db)}
+function saveUD(ud){
+  const db=loadDB();
+  db.users[currentUser]=ud;
+  saveDB(db);
+  if(window.PASSFirebase?.auth?.currentUser&&window.PASSFirebase.auth.currentUser.uid===currentUser){
+    window.PASSFirebase.savePassData(ud).catch(err=>console.warn('Firestore 同步失敗，已保留本機備份',err));
+  }
+}
 function getActiveDept(){return getUD().depts[currentDept]||null}
 function getDeptLabel(deptId){
   const d=getUD().depts?.[deptId];
@@ -69,37 +76,110 @@ function findCourseRef(id,ud=getUD()){
   return null;
 }
  
-// ═══ AUTH ═══
+// ═══ AUTH：Firebase Authentication + Firestore ═══
+function firebaseReady(timeout=8000){
+  return new Promise((resolve,reject)=>{
+    if(window.PASSFirebase)return resolve(window.PASSFirebase);
+    const started=Date.now();
+    const timer=setInterval(()=>{
+      if(window.PASSFirebase){clearInterval(timer);resolve(window.PASSFirebase);}
+      else if(Date.now()-started>timeout){clearInterval(timer);reject(new Error('Firebase 尚未載入，請確認 firebase-pass.js 已加入 index.html，且 firebaseConfig 已貼上。'));}
+    },100);
+  });
+}
+function authMsg(id,msg){const el=document.getElementById(id);if(el)el.textContent=msg||'';}
+function fbErrorMessage(error){
+  const code=error?.code||'';
+  const map={
+    'auth/invalid-email':'Email 格式不正確',
+    'auth/user-not-found':'此 Email 尚未註冊',
+    'auth/wrong-password':'密碼錯誤',
+    'auth/invalid-credential':'Email 或密碼錯誤',
+    'auth/email-already-in-use':'此 Email 已註冊',
+    'auth/weak-password':'密碼強度不足，請至少 6 個字元',
+    'auth/too-many-requests':'嘗試次數過多，請稍後再試',
+    'auth/network-request-failed':'網路連線失敗，請確認網路'
+  };
+  return map[code]||error?.message||'發生未知錯誤';
+}
+function ensureLocalUser(uid,ud){
+  const db=loadDB();
+  db.users[uid]=ud;
+  saveDB(db);
+}
+async function loadFirebaseUserData(user){
+  const fb=await firebaseReady();
+  let ud=null;
+  try{ud=await fb.loadPassData();}
+  catch(err){console.warn('Firestore 讀取失敗，改用本機快取',err);}
+  if(!ud||typeof ud!=='object'||!ud.depts){
+    const cached=loadDB().users[user.uid];
+    ud=cached&&cached.depts?cached:{
+      name:user.displayName||user.email?.split('@')[0]||'使用者',
+      email:user.email||'',
+      depts:{},
+      createdAt:new Date().toISOString()
+    };
+  }
+  ud.email=ud.email||user.email||'';
+  ensureLocalUser(user.uid,ud);
+  return ud;
+}
+async function enterFirebaseApp(user){
+  await loadFirebaseUserData(user);
+  enterApp(user.uid);
+}
 function switchAuthTab(t){
   document.getElementById('tab-login').style.display=t==='login'?'block':'none';
   document.getElementById('tab-register').style.display=t==='register'?'block':'none';
   document.querySelectorAll('.auth-tab').forEach((el,i)=>el.classList.toggle('active',(t==='login'&&i===0)||(t==='register'&&i===1)));
 }
-function doLogin(){
-  const u=document.getElementById('l-user').value.trim();
+async function doLogin(){
+  const email=document.getElementById('l-user').value.trim();
   const p=document.getElementById('l-pass').value;
-  const db=loadDB();
-  if(!db.users[u]){document.getElementById('l-err').textContent='帳號不存在';return;}
-  if(db.users[u].password!==btoa(p)){document.getElementById('l-err').textContent='密碼錯誤';return;}
-  document.getElementById('l-err').textContent='';
-  enterApp(u);
+  authMsg('l-err','');
+  if(!email||!p){authMsg('l-err','請輸入 Email 與密碼');return;}
+  try{
+    authMsg('l-err','登入中...');
+    const fb=await firebaseReady();
+    const user=await fb.passLogin(email,p);
+    authMsg('l-err','');
+    await enterFirebaseApp(user);
+    toast('✅ 已登入並同步雲端資料','ok');
+  }catch(error){
+    authMsg('l-err','登入失敗：'+fbErrorMessage(error));
+  }
 }
-function doRegister(){
+async function doRegister(){
   const name=document.getElementById('r-name').value.trim();
-  const u=document.getElementById('r-user').value.trim();
+  const email=document.getElementById('r-user').value.trim();
   const p=document.getElementById('r-pass').value;
   const p2=document.getElementById('r-pass2').value;
-  const err=s=>document.getElementById('r-err').textContent=s;
-  if(!name||!u){err('請填寫姓名與帳號');return;}
-  if(!/^[a-zA-Z0-9_]+$/.test(u)){err('帳號只能用英文、數字、底線');return;}
+  const err=s=>authMsg('r-err',s);
+  err('');
+  if(!name||!email){err('請填寫姓名與 Email');return;}
+  if(!/^\S+@\S+\.\S+$/.test(email)){err('請輸入正確 Email，例如 test@gmail.com');return;}
   if(p.length<6){err('密碼至少 6 個字元');return;}
   if(p!==p2){err('兩次密碼不一致');return;}
-  const db=loadDB();
-  if(db.users[u]){err('此帳號已存在');return;}
-  db.users[u]={name,password:btoa(p),depts:{}};
-  saveDB(db); err(''); enterApp(u);
+  try{
+    err('建立帳號中...');
+    const fb=await firebaseReady();
+    const user=await fb.passRegister(email,p);
+    currentUser=user.uid;
+    const ud={name,email:user.email||email,depts:{},createdAt:new Date().toISOString()};
+    ensureLocalUser(user.uid,ud);
+    await fb.savePassData(ud);
+    err('');
+    enterApp(user.uid);
+    toast('✅ 帳號已建立，資料會同步到 Firestore','ok');
+  }catch(error){
+    err('註冊失敗：'+fbErrorMessage(error));
+  }
 }
-function doLogout(){
+async function doLogout(){
+  try{
+    if(window.PASSFirebase)await window.PASSFirebase.passLogout();
+  }catch(err){console.warn('Firebase 登出失敗',err);}
   currentUser=null;currentDept=null;
   document.getElementById('auth-screen').style.display='flex';
   document.getElementById('app-screen').classList.remove('visible');
@@ -107,18 +187,28 @@ function doLogout(){
 function enterApp(u){
   currentUser=u;
   const ud=getUD();
-  const ids=Object.keys(ud.depts);
+  const ids=Object.keys(ud.depts||{});
   currentDept=ids.length?ids[0]:null;
   document.getElementById('auth-screen').style.display='none';
   document.getElementById('app-screen').classList.add('visible');
   updateSidebar();showPage('dashboard');
 }
+window.addEventListener('DOMContentLoaded',()=>{
+  firebaseReady(12000).then(fb=>{
+    fb.watchPassAuth(async user=>{
+      if(user&&!currentUser){
+        try{await enterFirebaseApp(user);}
+        catch(err){console.warn('自動登入同步失敗',err);}
+      }
+    });
+  }).catch(err=>console.warn(err.message));
+});
  
 // ═══ SIDEBAR ═══
 function updateSidebar(){
   const ud=getUD();
   document.getElementById('sb-avatar').textContent=(ud.name||'U')[0].toUpperCase();
-  document.getElementById('sb-name').textContent=ud.name||currentUser;
+  document.getElementById('sb-name').textContent=ud.name||ud.email||currentUser;
   const count=Object.keys(ud.depts||{}).length;
   document.getElementById('sb-dept').textContent=count?`共 ${count} 個科系 · 各頁自由篩選`:'尚未設定科系';
   syncDeptSelectors();
@@ -900,7 +990,7 @@ const XL_FIELDS=[
  
 function onDrag(e,on){e.preventDefault();document.getElementById('upload-zone').classList.toggle('drag',on);}
 function onDrop(e){e.preventDefault();onDrag(e,false);const f=e.dataTransfer.files[0];if(f)processXlFile(f);}
-function handleXlFile(e){const f=e.target.files[0];if(f)processXlFile(f);e.target.value='';}
+function handleXlFile(e){const f=e.target.files[0];if(f)processXlFile(f);}
  
 function processXlFile(file){
   if(typeof XLSX==='undefined'){
@@ -919,15 +1009,13 @@ function processXlFile(file){
  
 function renderSheetTabs(){
   xlSheetName=xlWorkbook.SheetNames[0];
-  const tabsHtml=xlWorkbook.SheetNames.map(n=>`<div class="xl-tab ${n===xlSheetName?'active':''}" onclick="selectSheet(${JSON.stringify(n).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;')})">${esc(n)}</div>`).join('');
+  const tabsHtml=xlWorkbook.SheetNames.map(n=>`<div class="xl-tab ${n===xlSheetName?'active':''}" onclick="selectSheet('${n}')">${n}</div>`).join('');
   document.getElementById('xl-sheet-area').innerHTML=`
     <div class="xl-preview">
       <div class="xl-preview-head"><span class="xl-preview-title">📋 檔案預覽</span></div>
       ${xlWorkbook.SheetNames.length>1?`<div class="xl-sheet-tabs">${tabsHtml}</div>`:''}
       <div class="xl-table-wrap"><table class="xl-table" id="xl-preview-table"></table></div>
     </div>`;
-  const hr=document.getElementById('xl-manual-header-row');if(hr){hr.value='';delete hr.dataset.userSet;}
-  const fm=document.getElementById('xl-force-normal');if(fm)fm.checked=false;
   loadSheetPreview();
   document.getElementById('xl-map-card').style.display='block';
   document.getElementById('xl-result-card').style.display='none';
@@ -943,28 +1031,14 @@ function selectSheet(name){
  
 function loadSheetPreview(){
   const ws=xlWorkbook.Sheets[xlSheetName];
-  const data=XLSX.utils.sheet_to_json(ws,{header:1,defval:'',raw:false});
+  const data=XLSX.utils.sheet_to_json(ws,{header:1,defval:''});
   xlSheetData=data;
   const table=document.getElementById('xl-preview-table');
-  const hint=document.getElementById('xl-header-hint');
-  if(!data.length){
-    table.innerHTML='<tr><td style="padding:1rem;color:var(--text3)">工作表為空</td></tr>';
-    if(hint){hint.textContent='';hint.style.display='none';}
-    return;
-  }
-  const info=getXlHeaderInfo();
-  updateManualHeaderInput(info);
-  const headerRow=info.headerRow||0;
-  const headers=info.headers&&info.headers.length?info.headers:(data[headerRow]||[]).map((h,i)=>getCell(data[headerRow],i)||`欄位 ${i+1}`);
-  const body=data.slice(info.dataStart||headerRow+1,(info.dataStart||headerRow+1)+10);
-  if(hint){
-    const confidence=info.matrix?'矩陣式學分表':(info.confidence>=10?'高':info.confidence>=5?'中':'低');
-    hint.style.display='block';
-    hint.innerHTML=`目前掃描：工作表「${esc(xlSheetName)}」／欄名列第 ${headerRow+1} 列／資料從第 ${(info.dataStart||headerRow+1)+1} 列開始／信心度：${confidence}。若不準，請直接手動調整下方欄位對應。`;
-  }
+  if(!data.length){table.innerHTML='<tr><td style="padding:1rem;color:var(--text3)">工作表為空</td></tr>';return;}
+  const headers=data[0];
   table.innerHTML=`
-    <thead><tr><th>#</th>${headers.map(h=>`<th>${esc(h)||''}</th>`).join('')}</tr></thead>
-    <tbody>${body.map((row,idx)=>`<tr><td>${(info.dataStart||headerRow+1)+idx+1}</td>${headers.map((_,i)=>`<td>${esc(row[i]||'')}</td>`).join('')}</tr>`).join('')}</tbody>`;
+    <thead><tr>${headers.map(h=>`<th>${h||''}</th>`).join('')}</tr></thead>
+    <tbody>${data.slice(1,11).map(row=>`<tr>${headers.map((_,i)=>`<td>${row[i]||''}</td>`).join('')}</tr>`).join('')}</tbody>`;
 }
  
 
@@ -1024,200 +1098,12 @@ function detectCreditMatrix(data){
   }
   return null;
 }
-
-const XL_FIELD_ALIASES={
-  name:['課程名稱','科目名稱','科目','課名','課程','名稱','course name','subject name','subject','name'],
-  courseCode:['課程代碼','課程編號','科目代碼','科目編號','課號','課碼','代碼','編號','流水號','course code','course no','course number','code','no.'],
-  credits:['學分數','學分','credits','credit','cr'],
-  type:['修別','類別','必選修','選別','課程類別','課別','type','category','kind'],
-  status:['修課狀態','狀態','完成狀態','是否通過','是否已修','status','progress','completed'],
-  grade:['成績','分數','等第','grade','score'],
-  sem:['建議修讀學期','建議學期','修讀學期','年級學期','開課學期','學年期','學期','semester','term'],
-  teacher:['授課老師','授課教師','教師姓名','教師','老師','teacher','instructor','professor'],
-  classTime:['上課時間','上課節次','課程時間','時間','節次','星期節次','time','period','schedule'],
-  classroom:['教室','上課教室','上課地點','地點','room','classroom','location'],
-  note:['備註','說明','註記','note','memo','remark']
-};
-function normalizeHeaderForMatch(s){
-  return (s??'').toString().toLowerCase().replace(/\s+/g,'').replace(/[\u3000:：\-—_\/\\()（）\[\]【】「」『』.,，。]/g,'');
-}
-function scoreHeaderForField(header,key){
-  const raw=(header??'').toString().trim();
-  if(!raw)return 0;
-  const h=normalizeHeaderForMatch(raw);
-  if(!h)return 0;
-  const aliases=XL_FIELD_ALIASES[key]||[];
-  let best=0;
-  aliases.forEach(a=>{
-    const n=normalizeHeaderForMatch(a);
-    if(!n)return;
-    if(h===n)best=Math.max(best,10);
-    else if(h.includes(n))best=Math.max(best,7);
-    else if(n.includes(h)&&h.length>=2)best=Math.max(best,4);
-  });
-  if(key==='name'&&/(課程|科目|課名|名稱)/.test(raw))best=Math.max(best,6);
-  if(key==='credits'&&/(學分|credit)/i.test(raw))best=Math.max(best,8);
-  if(key==='type'&&/(必選修|必修|選修|修別|類別|課別)/.test(raw))best=Math.max(best,7);
-  if(key==='courseCode'&&/(課號|課碼|編號|代碼|code|no\.?)/i.test(raw))best=Math.max(best,7);
-  if(key==='classTime'&&/(星期|節次|時間|period|time|schedule)/i.test(raw))best=Math.max(best,6);
-  return best;
-}
-function detectTabularHeader(data){
-  if(!data||!data.length)return{headerRow:0,dataStart:1,confidence:0,guess:{}};
-  const maxRows=Math.min(25,data.length);
-  const maxCols=Math.max(...data.slice(0,maxRows).map(r=>r?r.length:0),0);
-  let best={headerRow:0,dataStart:1,confidence:0,guess:{}};
-  for(let r=0;r<maxRows;r++){
-    const row=data[r]||[];
-    const nonEmpty=row.reduce((n,_,i)=>n+(getCell(row,i)?1:0),0);
-    if(nonEmpty<2)continue;
-    const guess={},fieldScores={};
-    for(let c=0;c<maxCols;c++){
-      const cell=getCell(row,c);
-      if(!cell)continue;
-      XL_FIELDS.forEach(f=>{
-        const sc=scoreHeaderForField(cell,f.key);
-        if(sc>(fieldScores[f.key]||0)){
-          fieldScores[f.key]=sc;
-          guess[f.key]=c;
-        }
-      });
-    }
-    let confidence=Object.values(fieldScores).reduce((a,b)=>a+b,0);
-    if(guess.name!==undefined)confidence+=10;
-    if(guess.credits!==undefined)confidence+=4;
-    if(guess.type!==undefined)confidence+=3;
-    if(guess.courseCode!==undefined)confidence+=2;
-    if(nonEmpty>=4)confidence+=2;
-    // 很多學校第一列會是「XX 大學課程表」這種標題，欄位數少或沒有課程名稱就降低權重。
-    if(guess.name===undefined&&confidence<12)confidence-=4;
-    if(confidence>best.confidence)best={headerRow:r,dataStart:r+1,confidence,guess};
-  }
-  return best;
-}
-function buildHeaderLabel(data,rowIndex,colIndex){
-  const current=getCell(data[rowIndex]||[],colIndex);
-  const prev=getCell(data[rowIndex-1]||[],colIndex);
-  if(current&&prev&&scoreHeaderForField(current,'name')===0&&scoreHeaderForField(current,'credits')===0&&scoreHeaderForField(current,'type')===0){
-    return `${prev} / ${current}`;
-  }
-  return current||prev||`欄位 ${colIndex+1}`;
-}
-function getManualHeaderRowIndex(){
-  const el=document.getElementById('xl-manual-header-row');
-  if(!el||el.dataset.userSet!=='1')return null;
-  const n=parseInt(el.value,10);
-  if(!Number.isFinite(n)||n<1||n>xlSheetData.length)return null;
-  return n-1;
-}
-function updateManualHeaderInput(info){
-  const el=document.getElementById('xl-manual-header-row');
-  if(!el)return;
-  if(el.dataset.userSet!=='1')el.value=String((info.headerRow||0)+1);
-}
-function onManualHeaderRowChange(el){
-  el.dataset.userSet='1';
-  loadSheetPreview();
-  renderMapRows();
-}
-function onForceNormalModeChange(){
-  loadSheetPreview();
-  renderMapRows();
-}
 function getXlHeaderInfo(){
-  const manualRow=getManualHeaderRowIndex();
-  const forceNormal=!!document.getElementById('xl-force-normal')?.checked||manualRow!==null;
-  const matrix=forceNormal?null:detectCreditMatrix(xlSheetData);
-  if(matrix)return{headers:matrix.headers,dataStart:matrix.dataStart,matrix,headerRow:matrix.headerRow,confidence:99,guess:{name:matrix.nameCol,type:matrix.typeCol,credits:matrix.creditCol},manual:false};
-  let detected=detectTabularHeader(xlSheetData);
-  if(manualRow!==null){
-    const row=xlSheetData[manualRow]||[];
-    const guess={},fieldScores={};
-    row.forEach((cell,i)=>{
-      XL_FIELDS.forEach(f=>{
-        const sc=scoreHeaderForField(cell,f.key);
-        if(sc>(fieldScores[f.key]||0)){fieldScores[f.key]=sc;guess[f.key]=i;}
-      });
-    });
-    detected={headerRow:manualRow,dataStart:manualRow+1,confidence:Object.values(fieldScores).reduce((a,b)=>a+b,0),guess,manual:true};
-  }
-  const rowIndex=detected.headerRow||0;
-  const row=xlSheetData[rowIndex]||[];
-  const maxCols=Math.max(row.length,...xlSheetData.slice(Math.max(0,rowIndex-1),Math.min(xlSheetData.length,rowIndex+2)).map(r=>r?r.length:0),0);
-  const headers=[];
-  for(let i=0;i<maxCols;i++)headers[i]=buildHeaderLabel(xlSheetData,rowIndex,i);
-  return{headers,dataStart:detected.dataStart||rowIndex+1,matrix:null,headerRow:rowIndex,confidence:detected.confidence||0,guess:detected.guess||{},manual:!!detected.manual};
+  const matrix=detectCreditMatrix(xlSheetData);
+  if(matrix)return{headers:matrix.headers,dataStart:matrix.dataStart,matrix};
+  const headers=(xlSheetData[0]||[]).map((h,i)=>getCell(xlSheetData[0],i)||`欄位 ${i+1}`);
+  return{headers,dataStart:1,matrix:null};
 }
-
-function getXlTargetDeptId(){return document.getElementById('xl-import-dept')?.value||currentDept||'';}
-function getXlTargetSchool(){
-  const ud=getUD();
-  const dept=ud.depts?.[getXlTargetDeptId()];
-  const sid=dept?.schoolId||'';
-  return sid?{id:sid,school:ud.schools?.[sid]||null}:null;
-}
-function getSchoolImportTemplate(){
-  const target=getXlTargetSchool();
-  return target&&target.school?target.school.importTemplate||null:null;
-}
-function applyTemplateToGuess(headers,template,guess){
-  if(!template||!template.fields)return guess;
-  const next={...guess};
-  Object.entries(template.fields).forEach(([key,item])=>{
-    if(!item)return;
-    const wanted=normalizeHeaderForMatch(item.header||'');
-    let idx=-1;
-    if(wanted){
-      idx=headers.findIndex(h=>normalizeHeaderForMatch(h)===wanted||normalizeHeaderForMatch(h).includes(wanted)||wanted.includes(normalizeHeaderForMatch(h)));
-    }
-    if(idx<0&&Number.isInteger(item.idx)&&item.idx>=0&&item.idx<headers.length)idx=item.idx;
-    if(idx>=0)next[key]=idx;
-  });
-  return next;
-}
-function collectCurrentXlMap(){
-  const map={};
-  XL_FIELDS.forEach(f=>{
-    const el=document.getElementById('map-'+f.key);
-    const v=el?el.value:'';
-    if(v!=='')map[f.key]=+v;
-  });
-  return map;
-}
-function saveXlMappingForSchool(){
-  const target=getXlTargetSchool();
-  if(!target||!target.school){toast('請先在「學校設定」把科系綁定到學校，再儲存欄位模板','err');return;}
-  if(!xlSheetData.length){toast('請先上傳檔案','err');return;}
-  const info=getXlHeaderInfo();
-  const map=collectCurrentXlMap();
-  if(map.name===undefined){toast('請至少設定「課程名稱」欄位再儲存模板','err');return;}
-  const fields={};
-  Object.entries(map).forEach(([key,idx])=>{fields[key]={idx,header:info.headers[idx]||`欄位 ${idx+1}`};});
-  const ud=getUD();
-  if(!ud.schools)ud.schools={};
-  if(!ud.schools[target.id]){toast('找不到學校','err');return;}
-  ud.schools[target.id].importTemplate={sheetName:xlSheetName,headerRow:info.headerRow||0,dataStart:info.dataStart||1,fields,updatedAt:new Date().toISOString()};
-  saveUD(ud);
-  toast(`✅ 已儲存「${target.school.name||'此學校'}」的匯入欄位模板`,'ok');
-  renderMapRows(true);
-}
-function applyXlMappingForSchool(){
-  const target=getXlTargetSchool();
-  if(!target||!target.school){toast('這個科系尚未綁定學校，無法套用學校模板','err');return;}
-  if(!target.school.importTemplate){toast('此學校尚未儲存欄位模板','err');return;}
-  renderMapRows(true);
-  toast(`✅ 已套用「${target.school.name||'此學校'}」的欄位模板`,'ok');
-}
-function clearXlMappingForSchool(){
-  const target=getXlTargetSchool();
-  if(!target||!target.school){toast('這個科系尚未綁定學校','err');return;}
-  const ud=getUD();
-  if(ud.schools?.[target.id])delete ud.schools[target.id].importTemplate;
-  saveUD(ud);
-  renderMapRows();
-  toast('已清除此學校的匯入欄位模板','ok');
-}
-function onXlTargetDeptChange(){renderMapRows();}
 function updateMatrixHint(matrix){
   const box=document.getElementById('xl-matrix-hint');
   if(!box)return;
@@ -1231,35 +1117,31 @@ function updateMatrixHint(matrix){
 }
 
 
-function renderMapRows(forceTemplate=false){
+function renderMapRows(){
   if(!xlSheetData.length)return;
   const info=getXlHeaderInfo();
   const headers=info.headers||[];
   updateMatrixHint(info.matrix);
-  const opts=['<option value="">— 略過 —</option>',...headers.map((h,i)=>`<option value="${i}">${esc(h)||`欄位 ${i+1}`}</option>`)].join('');
-  let guess={...(info.guess||{})};
+  const opts=['<option value="">— 略過 —</option>',...headers.map((h,i)=>`<option value="${i}">${h||`欄位 ${i+1}`}</option>`)].join('');
+  const guess={};
   headers.forEach((h,i)=>{
-    XL_FIELDS.forEach(f=>{
-      const sc=scoreHeaderForField(h,f.key);
-      if(sc>=6&&guess[f.key]===undefined)guess[f.key]=i;
-    });
+    const s=(h||'').toString().toLowerCase();
+    if(s.includes('課號')||s.includes('代碼')||s.includes('code'))guess['courseCode']=i;
+    else if(s.includes('名稱')||s.includes('課程')||s.includes('科目')||s.includes('name'))guess['name']=i;
+    else if(s.includes('學分')||s.includes('credit'))guess['credits']=i;
+    else if(s.includes('狀態')||s.includes('修課')||s.includes('status')||s.includes('完成'))guess['status']=i;
+    else if((s.includes('類別')||s.includes('type')||s.includes('修別')||s.includes('必選修'))&&!s.includes('狀態'))guess['type']=i;
+    else if(s.includes('成績')||s.includes('grade')||s.includes('score'))guess['grade']=i;
+    else if(s.includes('學期')||s.includes('sem'))guess['sem']=i;
+    else if(s.includes('老師')||s.includes('教師')||s.includes('teacher')||s.includes('instructor'))guess['teacher']=i;
+    else if(s.includes('時間')||s.includes('節次')||s.includes('time')||s.includes('period'))guess['classTime']=i;
+    else if(s.includes('教室')||s.includes('地點')||s.includes('room')||s.includes('classroom'))guess['classroom']=i;
+    else if(s.includes('備註')||s.includes('note'))guess['note']=i;
   });
   if(info.matrix){
     guess.name=info.matrix.nameCol;
     if(info.matrix.typeCol>=0)guess.type=info.matrix.typeCol;
     if(info.matrix.creditCol>=0)guess.credits=info.matrix.creditCol;
-  }
-  const saved=getSchoolImportTemplate();
-  if(saved)guess=applyTemplateToGuess(headers,saved,guess);
-  const target=getXlTargetSchool();
-  const templateText=target&&target.school?
-    (saved?`已載入「${esc(target.school.name||'此學校')}」的欄位模板；若這次格式不同仍可手動改。`:`「${esc(target.school.name||'此學校')}」尚未儲存欄位模板；手動調好後可按「儲存此校對應」。`):
-    '目前匯入科系尚未綁定學校；仍可手動對應欄位並匯入。';
-  const scanText=info.matrix?'已偵測為矩陣式學分表。':`${info.manual?'手動指定':'自動偵測'}欄名列：第 ${(info.headerRow||0)+1} 列，資料起始：第 ${(info.dataStart||1)+1} 列。`;
-  const scanBox=document.getElementById('xl-scan-hint');
-  if(scanBox){
-    scanBox.style.display='block';
-    scanBox.innerHTML=`${scanText}<br>${templateText}`;
   }
   document.getElementById('xl-map-rows').innerHTML=XL_FIELDS.map(f=>`
     <div class="map-row" style="display:grid;grid-template-columns:130px 20px 1fr;gap:8px;align-items:center;margin-bottom:8px;">
@@ -1352,7 +1234,7 @@ function parseXlData(){
     if(nameCol===''){toast('請設定「課程名稱」對應的欄位','err');return;}
     xlSheetData.slice(info.dataStart||1).forEach(row=>{
       const name=getCell(row,map['name']);
-      if(!name||/(科目名稱|課程名稱|合計|小計|總計|備註|說明)/.test(name))return;
+      if(!name)return;
       const semText=map['sem']!==undefined?getCell(row,map['sem']):'';
       const semParts=getSemesterParts({sem:semText});
       const rawTime=map['classTime']!==undefined?getCell(row,map['classTime']):'';
@@ -1402,9 +1284,9 @@ function normalizeType(s){
   s=(s||'').toString().trim();
   if(!s)return '必修';
   if(normalizeStatus(s))return '必修';
-  if(s.includes('通識')||s.includes('共同')||s.includes('博雅')||s.includes('核心'))return '通識';
-  if(s.includes('選修')||s.includes('選')||s.includes('elective'))return '選修';
-  if(s.includes('必修')||s.includes('必')||s.includes('required'))return '必修';
+  if(s.includes('通識'))return '通識';
+  if(s.includes('選修')||s.includes('選'))return '選修';
+  if(s.includes('必修')||s.includes('必'))return '必修';
   return '必修';
 }
 function normalizeGrade(s){
@@ -1507,7 +1389,7 @@ function exportData(){
   const backupText=JSON.stringify({user:currentUser,data:ud},null,2);
   const blob=new Blob([backupText],{type:'text/plain;charset=utf-8'});
   const a=document.createElement('a');a.href=URL.createObjectURL(blob);
-  a.download=`PASS資料備份_${currentUser}_${new Date().toLocaleDateString('zh-TW').replace(/\//g,'-')}.txt`;
+  a.download=`PASS資料備份_${(ud.email||ud.name||currentUser).replace(/[^a-zA-Z0-9_@.-]/g,'_')}_${new Date().toLocaleDateString('zh-TW').replace(/\//g,'-')}.txt`;
   a.click();toast('📥 資料備份文字檔已匯出','ok');
 }
 function importData(e){
